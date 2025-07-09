@@ -6,14 +6,28 @@
 int
 main(int argc, char *argv[])
 {
-  // your code here.  you should write the secret to fd 2 using write
-  // (e.g., write(2, secret, 8)
-  if(argc != 1){
-    printf("Usage: secret the-secret\n");
-    exit(1);
+  // 分配大量堆空间，尽量复用 secret 所释放的页
+  char *buf = sbrk(32 * PGSIZE);
+  
+  // 秘密位于 secret 进程堆中的第 9 页，偏移 32 字节处
+  // 所以我们从堆中第 9 页附近开始寻找残留数据
+  for (int i = 0; i < 32 * PGSIZE - 8; i++) {
+    char *p = buf + i;
+    // 检查是否可能是 ASCII 字符串（可选：增加可信度）
+    int plausible = 1;
+    for (int j = 0; j < 8; j++) {
+      if (p[j] == 0 || p[j] > 126 || p[j] < 32) {
+        plausible = 0;
+        break;
+      }
+    }
+    if (plausible) {
+      // 找到了可能的 secret，写入到 fd 2
+      write(2, p, 8);
+      write(2, "\n", 1);
+      break;
+    }
   }
-  char *end = sbrk(PGSIZE*32);
-  end = end + 8 * PGSIZE;
-  fprintf(2, end+16, 8);
-  exit(1);
+
+  exit(0);
 }
