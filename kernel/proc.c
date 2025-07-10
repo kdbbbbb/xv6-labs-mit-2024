@@ -158,6 +158,11 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+
+   if (p->usys)
+    kfree((void*)p->usys);
+  p->usys = 0;
+
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
@@ -202,6 +207,17 @@ proc_pagetable(struct proc *p)
     return 0;
   }
 
+ // 映射 USYSCALL 页
+  void *usys = kalloc();
+if (usys == 0 || mappages(pagetable, USYSCALL, PGSIZE, (uint64)usys, PTE_R | PTE_W | PTE_U) < 0) {
+    kfree(usys);
+    uvmfree(pagetable, p->sz);
+    return 0;
+  }
+  memset(usys, 0, PGSIZE);
+  p->usys = (struct usyscall *)usys;
+
+  
   return pagetable;
 }
 
@@ -212,6 +228,7 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
 {
   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
   uvmunmap(pagetable, TRAPFRAME, 1, 0);
+  uvmunmap(pagetable, USYSCALL, 1, 0);
   uvmfree(pagetable, sz);
 }
 
@@ -311,7 +328,7 @@ fork(void)
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
-
+  np->usys->pid = pid;
   release(&np->lock);
 
   acquire(&wait_lock);

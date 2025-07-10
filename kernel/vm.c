@@ -7,6 +7,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "fs.h"
+#include <stdint.h>
 
 /*
  * the kernel's page table.
@@ -487,12 +488,67 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 }
 
 
+
+
+
+#include <stddef.h>  // 确保定义 NULL
+
+char* pa2kva(uint64 pa) {
+    // 物理地址转换到内核虚拟地址，检查是否有效
+    if (pa < PHYSTOP) {  // 确保物理地址在有效范围内
+        return (char *)(pa + KERNBASE);  // 转换为内核虚拟地址
+    } else {
+        printf("Invalid physical address: %p\n", (void *)pa);
+        return NULL;  // 返回 NULL 表示无效地址
+    }
+}
 #ifdef LAB_PGTBL
-void
-vmprint(pagetable_t pagetable) {
-  // your code here
+void vmprint_walk(pagetable_t pagetable, int level, uint64 va_base) {
+    if (pagetable == 0)
+        return;
+
+    for (int i = 0; i < 512; i++) {
+        pte_t pte = pagetable[i];
+
+        // 如果 PTE 无效，跳过
+        if ((pte & PTE_V) == 0)
+            continue;
+
+        uint64 pa = PTE2PA(pte);  // 获取物理地址
+        uint64 va = va_base | ((uint64)i << (12 + 9 * level));  // 计算虚拟地址
+
+        // 打印当前页表项的信息，注意缩进
+        for (int j = 0; j < level; j++)
+            printf(" ..");
+
+        // 打印虚拟地址、PTE 和物理地址
+        printf("%p: pte %p pa %p\n", (void *)va, (void *)(uintptr_t)pte, (void *)(uintptr_t)pa);
+
+        // 如果 PTE 不含读/写/执行权限，且当前不是最后一层页表
+        if ((pte & (PTE_R | PTE_W | PTE_X)) == 0 && level > 0) {
+            // 将物理地址转换为内核虚拟地址
+            uint64 kva = (uint64)(pa2kva(pa));
+
+            // 检查 kva 是否有效，防止访问无效的地址
+if (kva != 0 && kva >= KERNBASE && kva < PHYSTOP + KERNBASE) {
+    // 递归调用打印下一级页表
+    vmprint_walk((pagetable_t)kva, level - 1, va);
+} else {
+    printf(" ..Skipping invalid kva=%p\n", (void *)kva);
+}
+        }
+    }
+}
+
+// 打印页表内容的入口函数
+void vmprint(pagetable_t pagetable) {
+    printf("page table %p\n", (void *)pagetable);
+    vmprint_walk(pagetable, 2, 0);
 }
 #endif
+
+
+
 
 
 
@@ -501,4 +557,4 @@ pte_t*
 pgpte(pagetable_t pagetable, uint64 va) {
   return walk(pagetable, va, 0);
 }
-#endif
+#endif 
