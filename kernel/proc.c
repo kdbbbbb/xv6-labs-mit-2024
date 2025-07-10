@@ -146,6 +146,14 @@ found:
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
 
+  // 初始化进程的其他成员
+    p->alarm_interval = 0;  // 设置 alarm 时间间隔为 0
+    p->handler_va = 0;      // 设置 handler 为 0
+    p->passed_ticks = 0;    // 设置 passed_ticks 为 0
+    p->have_return = 0;     // 设置 have_return 为 0
+
+    // 初始化保存的 trapframe
+    memset(&p->saved_trapframe, 0, sizeof(p->saved_trapframe));
   return p;
 }
 

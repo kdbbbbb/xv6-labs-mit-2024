@@ -16,6 +16,25 @@
 #include "proc.h"
 
 volatile int panicked = 0;
+void backtrace() {
+    uint64 fp = r_fp();  // 获取当前栈帧
+
+    // 获取用户栈最高地址
+    uint64 top = PGROUNDUP(fp);
+    // 获取用户栈最低地址
+    uint64 bottom = PGROUNDDOWN(fp);
+
+    // 循环遍历栈帧并输出返回地址
+    for (; fp >= bottom && fp < top; ) {
+        // 输出当前栈中返回地址
+        printf("%p\n", (void *)*((uint64 *)(fp - 8)));
+        // 获取下一栈帧
+        fp = *((uint64 *)(fp - 16));
+    }
+}
+
+
+
 
 // lock to avoid interleaving concurrent printf's.
 static struct {
@@ -165,6 +184,7 @@ panic(char *s)
   pr.locking = 0;
   printf("panic: ");
   printf("%s\n", s);
+  backtrace();
   panicked = 1; // freeze uart output from other CPUs
   for(;;)
     ;

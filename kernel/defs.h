@@ -77,9 +77,10 @@ int             piperead(struct pipe*, uint64, int);
 int             pipewrite(struct pipe*, uint64, int);
 
 // printf.c
-int            printf(char*, ...) __attribute__ ((format (printf, 1, 2)));
+int             printf(char*, ...) __attribute__ ((format (printf, 1, 2)));
 void            panic(char*) __attribute__((noreturn));
 void            printfinit(void);
+void            backtrace();
 
 // proc.c
 int             cpuid(void);
@@ -142,7 +143,8 @@ int             fetchaddr(uint64, uint64*);
 void            syscall();
 
 // trap.c
-extern uint     ticks;
+
+extern uint ticks;  // 正确：全局变量声明
 void            trapinit(void);
 void            trapinithart(void);
 extern struct spinlock tickslock;
