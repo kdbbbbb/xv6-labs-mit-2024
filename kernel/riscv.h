@@ -1,5 +1,9 @@
 #ifndef __ASSEMBLER__
 
+#define PTE_X (1L << 3)
+#define PTE_U (1L << 4) // 1 -> user can access
+#define PTE_RSW (1L << 8) // 用这个标志位来表示cow的页面错误
+
 // which hart (core) is this?
 static inline uint64
 r_mhartid()
