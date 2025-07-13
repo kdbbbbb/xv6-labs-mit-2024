@@ -91,32 +91,58 @@ e1000_init(uint32 *xregs)
   regs[E1000_IMS] = (1 << 7); // RXDW -- Receiver Descriptor Write Back
 }
 
+
 int
 e1000_transmit(char *buf, int len)
 {
-  //
-  // Your code here.
-  //
-  // buf contains an ethernet frame; program it into
-  // the TX descriptor ring so that the e1000 sends it. Stash
-  // a pointer so that it can be freed after send completes.
-  //
+  uint32 tail = regs[E1000_TDT];
+  struct tx_desc *desc = &tx_ring[tail];
 
-  
+  // 如果硬件还没发送完成，不能覆盖
+  if (!(desc->status & E1000_TXD_STAT_DD)) {
+    return -1;
+  }
+
+  desc->addr = (uint64)buf;
+  desc->length = len;
+  desc->cmd = E1000_TXD_CMD_RS | E1000_TXD_CMD_EOP;
+  desc->status = 0;
+
+  // 更新尾指针，通知硬件发送
+  regs[E1000_TDT] = (tail + 1) % TX_RING_SIZE;
+
   return 0;
 }
 
-static void
-e1000_recv(void)
-{
-  //
-  // Your code here.
-  //
-  // Check for packets that have arrived from the e1000
-  // Create and deliver a buf for each packet (using net_rx()).
-  //
+void e1000_recv(void) {
+  acquire(&e1000_lock);  // 记得加锁，防止并发
 
+  uint32 idx = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
+
+  while (rx_ring[idx].status & E1000_RXD_STAT_DD) {
+    int len = rx_ring[idx].length;
+    char *buf = rx_bufs[idx];
+
+    net_rx(buf, len);  // 交给协议栈处理
+
+    char *newbuf = kalloc();
+    if (!newbuf) {
+      printf("e1000_recv: kalloc failed\n");
+      break;
+    }
+
+    rx_ring[idx].addr = (uint64)newbuf;
+    rx_ring[idx].status = 0;
+    rx_bufs[idx] = newbuf;
+
+    regs[E1000_RDT] = idx;  // 更新已完成处理的接收描述符
+
+    idx = (idx + 1) % RX_RING_SIZE;
+  }
+
+  release(&e1000_lock);
 }
+
 
 void
 e1000_intr(void)
