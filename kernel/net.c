@@ -251,53 +251,7 @@ sys_send(void)
 }
 
 
-void
-ip_rx(char *buf, int len)
-{
-  static int seen_ip = 0;
-  if(seen_ip == 0)
-    printf("ip_rx: received an IP packet\n");
-  seen_ip = 1;
 
-  struct eth *eth = (struct eth *)buf;
-  struct ip *ip = (struct ip *)(eth + 1);
-  if(ip->ip_p != IPPROTO_UDP){
-    kfree(buf);
-    return;
-  }
-
-  int ip_len = ntohs(ip->ip_len);
-  struct udp *udp = (struct udp *)(ip + 1);
-  int dport = ntohs(udp->dport);
-  int sport = ntohs(udp->sport);
-  uint32 src_ip = ntohl(ip->ip_src);
-  //char *payload = (char *)(udp + 1);
-  int data_len = ip_len - sizeof(struct ip) - sizeof(struct udp);
-
-  if(dport < 0 || dport >= MAX_PORTS){
-    kfree(buf);
-    return;
-  }
-
-  struct udp_queue *q = &udp_ports[dport];
-  acquire(&q->lock);
-  if(!q->bound || q->size >= UDP_RECV_QUEUE){
-    release(&q->lock);
-    kfree(buf);
-    return;
-  }
-
-  struct udp_packet *pkt = &q->packets[q->tail];
-  pkt->src_ip = src_ip;
-  pkt->sport = sport;
-  pkt->len = data_len;
-  pkt->data = buf;
-
-  q->tail = (q->tail + 1) % UDP_RECV_QUEUE;
-  q->size++;
-  wakeup(q);
-  release(&q->lock);
-}
 
 //
 // send an ARP reply packet to tell qemu to map
@@ -345,6 +299,58 @@ arp_rx(char *inbuf)
   e1000_transmit(buf, sizeof(*eth) + sizeof(*arp));
 
   kfree(inbuf);
+}
+void ip_rx(char *buf, int len)
+{
+  static int seen_ip = 0;
+  if (seen_ip == 0)
+    printf("ip_rx: received an IP packet\n");
+  seen_ip = 1;
+
+  struct eth *eth = (struct eth *)buf;
+  struct ip *ip = (struct ip *)(eth + 1);
+
+  if (ip->ip_p != IPPROTO_UDP) {
+    kfree(buf);
+    return;
+  }
+
+  int ip_len = ntohs(ip->ip_len);  // 使用 ntohs 转换 IP 长度
+  struct udp *udp = (struct udp *)(ip + 1);
+  int dport = ntohs(udp->dport);   // 目标端口
+  int sport = ntohs(udp->sport);   // 源端口
+  uint32 src_ip = ntohl(ip->ip_src);  // 源 IP
+  int data_len = ip_len - sizeof(struct ip) - sizeof(struct udp);  // 计算有效载荷长度
+
+  if (dport >= MAX_PORTS) {  // 检查目标端口是否合法
+    kfree(buf);
+    return;
+  }
+
+  struct udp_queue *q = &udp_ports[dport];
+  acquire(&q->lock);
+
+  // 如果端口未绑定或队列已满，丢弃数据包
+  if (!q->bound || q->size >= UDP_RECV_QUEUE) {
+    release(&q->lock);
+    kfree(buf);
+    return;
+  }
+
+  // 存储数据包信息
+  struct udp_packet *pkt = &q->packets[q->tail];
+  pkt->src_ip = src_ip;
+  pkt->sport = sport;
+  pkt->len = data_len;
+  pkt->data = buf;
+
+  // 更新队列
+  q->tail = (q->tail + 1) % UDP_RECV_QUEUE;
+  q->size++;
+
+  // 唤醒等待数据包的进程
+  wakeup(q); 
+  release(&q->lock);
 }
 
 void
