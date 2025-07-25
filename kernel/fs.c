@@ -379,6 +379,8 @@ iunlockput(struct inode *ip)
 // Return the disk block address of the nth block in inode ip.
 // If there is no such block, bmap allocates one.
 // returns 0 if out of disk space.
+// Return the disk block address of the nth block in inode ip.
+// If there is no such block, bmap allocates one.
 static uint
 bmap(struct inode *ip, uint bn)
 {
@@ -386,34 +388,51 @@ bmap(struct inode *ip, uint bn)
   struct buf *bp;
 
   if(bn < NDIRECT){
-    if((addr = ip->addrs[bn]) == 0){
-      addr = balloc(ip->dev);
-      if(addr == 0)
-        return 0;
-      ip->addrs[bn] = addr;
-    }
+    if((addr = ip->addrs[bn]) == 0)
+      ip->addrs[bn] = addr = balloc(ip->dev);
     return addr;
   }
   bn -= NDIRECT;
 
   if(bn < NINDIRECT){
     // Load indirect block, allocating if necessary.
-    if((addr = ip->addrs[NDIRECT]) == 0){
-      addr = balloc(ip->dev);
-      if(addr == 0)
-        return 0;
-      ip->addrs[NDIRECT] = addr;
-    }
+    if((addr = ip->addrs[NDIRECT]) == 0)
+      ip->addrs[NDIRECT] = addr = balloc(ip->dev);
     bp = bread(ip->dev, addr);
     a = (uint*)bp->data;
     if((addr = a[bn]) == 0){
-      addr = balloc(ip->dev);
-      if(addr){
-        a[bn] = addr;
-        log_write(bp);
-      }
+      a[bn] = addr = balloc(ip->dev);
+      log_write(bp);
     }
     brelse(bp);
+    return addr;
+  }
+  bn -= NINDIRECT;
+
+  uint indirect_idx, final_offset;
+  struct buf *bp2;
+  if (bn < NDOUBLEINDIRECT) {
+    // Load double-indirect block, allocating if necessary
+    if((addr = ip->addrs[NDIRECT+1]) == 0)
+      ip->addrs[NDIRECT+1] = addr = balloc(ip->dev);
+    indirect_idx = bn / NINDIRECT;
+    final_offset = bn % NINDIRECT;
+    bp = bread(ip->dev, addr);
+    a = (uint*)bp->data;
+    // Load indirect block, allocating if necessary
+    if ((addr = a[indirect_idx]) == 0) {
+      a[indirect_idx] = addr = balloc(ip->dev);
+      log_write(bp);
+    }
+    brelse(bp);
+
+    bp2 = bread(ip->dev, addr);
+    a = (uint*)bp2->data;
+    if ((addr = a[final_offset]) == 0) {
+      a[final_offset] = addr = balloc(ip->dev);
+      log_write(bp2);
+    }
+    brelse(bp2);
     return addr;
   }
 
@@ -422,35 +441,60 @@ bmap(struct inode *ip, uint bn)
 
 // Truncate inode (discard contents).
 // Caller must hold ip->lock.
-void
-itrunc(struct inode *ip)
+void itrunc(struct inode *ip)
 {
-  int i, j;
-  struct buf *bp;
-  uint *a;
+    int i, j;
+    struct buf *bp, *bp2;
+    uint *a, *b;
 
-  for(i = 0; i < NDIRECT; i++){
-    if(ip->addrs[i]){
-      bfree(ip->dev, ip->addrs[i]);
-      ip->addrs[i] = 0;
+    // 释放直接块
+    for(i = 0; i < NDIRECT; i++){
+        if(ip->addrs[i]){
+            bfree(ip->dev, ip->addrs[i]);
+            ip->addrs[i] = 0;
+        }
     }
-  }
 
-  if(ip->addrs[NDIRECT]){
-    bp = bread(ip->dev, ip->addrs[NDIRECT]);
-    a = (uint*)bp->data;
-    for(j = 0; j < NINDIRECT; j++){
-      if(a[j])
-        bfree(ip->dev, a[j]);
+    // 释放单间接块
+    if(ip->addrs[NDIRECT]){
+        bp = bread(ip->dev, ip->addrs[NDIRECT]);
+        a = (uint*)bp->data;
+        for(j = 0; j < NINDIRECT; j++){
+            if(a[j])
+                bfree(ip->dev, a[j]);
+        }
+        brelse(bp);
+        bfree(ip->dev, ip->addrs[NDIRECT]);
+        ip->addrs[NDIRECT] = 0;
     }
-    brelse(bp);
-    bfree(ip->dev, ip->addrs[NDIRECT]);
-    ip->addrs[NDIRECT] = 0;
-  }
 
-  ip->size = 0;
-  iupdate(ip);
+    // 释放双重间接块
+    if(ip->addrs[NDIRECT + 1]){
+        bp = bread(ip->dev, ip->addrs[NDIRECT + 1]);  // 读取双重间接块
+        a = (uint*)bp->data;
+        for(i = 0; i < NINDIRECT; i++){
+            if(a[i]){
+                // 读取单间接块
+                bp2 = bread(ip->dev, a[i]);
+                b = (uint*)bp2->data;
+                // 释放指向的数据块
+                for(j = 0; j < NINDIRECT; j++){
+                    if(b[j])
+                        bfree(ip->dev, b[j]);
+                }
+                brelse(bp2);
+                bfree(ip->dev, a[i]);  // 释放单间接块
+            }
+        }
+        brelse(bp);
+        bfree(ip->dev, ip->addrs[NDIRECT + 1]);  // 释放双重间接块
+        ip->addrs[NDIRECT + 1] = 0;
+    }
+
+    ip->size = 0;
+    iupdate(ip);
 }
+
 
 // Copy stat information from inode.
 // Caller must hold ip->lock.
