@@ -7,7 +7,6 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "fs.h"
-#include <stdint.h>
 
 /*
  * the kernel's page table.
@@ -117,7 +116,23 @@ walk(pagetable_t pagetable, uint64 va, int alloc)
   }
   return &pagetable[PX(0, va)];
 }
-
+pte_t*
+superwalk(pagetable_t pagetable, uint64 va, int alloc)
+{
+  if(va >= MAXVA)
+    panic("superwalk");
+  int level = 2;
+  pte_t *pte = &pagetable[PX(level, va)];
+  if(*pte & PTE_V) {
+    pagetable = (pagetable_t)PTE2PA(*pte);
+  } else {
+    if(!alloc || (pagetable = (pde_t*)kalloc()) == 0)
+      return 0; 
+    memset(pagetable, 0, PGSIZE);
+    *pte = PA2PTE(pagetable) | PTE_V ;
+  }
+  return &pagetable[PX(1, va)];
+}
 // Look up a virtual address, return the physical address,
 // or 0 if not mapped.
 // Can only be used to look up user pages.
@@ -171,7 +186,7 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
 
   if(size == 0)
     panic("mappages: size");
-  
+
   a = va;
   last = va + size - PGSIZE;
   for(;;){
@@ -185,6 +200,20 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
     a += PGSIZE;
     pa += PGSIZE;
   }
+  return 0;
+}
+
+int
+mappages_super(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
+{
+  pte_t *pte;
+  if (va % SUPERPGSIZE != 0)
+    panic("mappages: superpage va not aligned");
+  if (size != SUPERPGSIZE)
+    panic("mappages: superpage size wrong");
+  if ((pte = superwalk(pagetable, va, 1)) == 0)
+    return -1;
+  *pte = PA2PTE(pa) | perm | PTE_V | PTE_SUPER |PTE_R;
   return 0;
 }
 
@@ -202,7 +231,7 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
     panic("uvmunmap: not aligned");
 
   for(a = va; a < va + npages*PGSIZE; a += sz){
-    sz = PGSIZE;
+    
     if((pte = walk(pagetable, a, 0)) == 0)
       panic("uvmunmap: walk");
     if((*pte & PTE_V) == 0) {
@@ -211,9 +240,18 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
     }
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
-    if(do_free){
-      uint64 pa = PTE2PA(*pte);
-      kfree((void*)pa);
+    if(*pte & PTE_SUPER){
+      sz = SUPERPGSIZE;
+      if(do_free){
+        uint64 pa = PTE2PA(*pte);
+        superkfree((void*)pa);
+      }
+    } else {
+      sz = PGSIZE;
+      if(do_free){
+        uint64 pa = PTE2PA(*pte);
+        kfree((void *)pa);
+      }
     }
     *pte = 0;
   }
@@ -263,8 +301,8 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
 
   oldsz = PGROUNDUP(oldsz);
   for(a = oldsz; a < newsz; a += sz){
-    sz = PGSIZE;
-    mem = kalloc();
+      sz = PGSIZE;
+      mem = kalloc();
     if(mem == 0){
       uvmdealloc(pagetable, a, oldsz);
       return 0;
@@ -274,6 +312,35 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
 #endif
     if(mappages(pagetable, a, sz, (uint64)mem, PTE_R|PTE_U|xperm) != 0){
       kfree(mem);
+      uvmdealloc(pagetable, a, oldsz);
+      return 0;
+    }
+  }
+  return newsz;
+}
+
+uint64
+uvmalloc_super(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
+{
+  char *mem;
+  uint64 a;
+  int sz;
+
+  if (newsz < oldsz)
+    return oldsz;
+
+  for (a = oldsz; a < newsz; a += sz)
+  {
+    sz = SUPERPGSIZE;
+    mem = superkalloc();
+    if (mem == 0)
+    {
+      uvmdealloc(pagetable, a, oldsz);
+      return 0;
+    }
+    if (mappages_super(pagetable, a, sz, (uint64)mem, PTE_R | PTE_U | xperm) != 0)
+    {
+      superkfree(mem);
       uvmdealloc(pagetable, a, oldsz);
       return 0;
     }
@@ -313,6 +380,11 @@ freewalk(pagetable_t pagetable)
       freewalk((pagetable_t)child);
       pagetable[i] = 0;
     } else if(pte & PTE_V){
+      if((pte & PTE_SUPER)){
+        continue;
+      }
+      //printf("sth wrong here i:%d, pte:%ld",i,pte);
+      //pte=0;
       panic("freewalk: leaf");
     }
   }
@@ -353,12 +425,25 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
+    if(flags & PTE_SUPER){
+      szinc = SUPERPGSIZE;
+      if((mem = superkalloc()) == 0)
+        goto err;
+      memmove(mem, (char*)pa, SUPERPGSIZE);
+      if(mappages_super(new, i, SUPERPGSIZE, (uint64)mem, flags) != 0){
+        superkfree(mem);
+        goto err;
+      }
+    }
+    else{
+      if ((mem = kalloc()) == 0)
+        goto err;
+      memmove(mem, (char *)pa, PGSIZE);
+      if (mappages(new, i, PGSIZE, (uint64)mem, flags) != 0)
+      {
+        kfree(mem);
+        goto err;
+      }
     }
   }
   return 0;
@@ -488,67 +573,48 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 }
 
 
-
-
-
-#include <stddef.h>  // 确保定义 NULL
-
-char* pa2kva(uint64 pa) {
-    // 物理地址转换到内核虚拟地址，检查是否有效
-    if (pa < PHYSTOP) {  // 确保物理地址在有效范围内
-        return (char *)(pa + KERNBASE);  // 转换为内核虚拟地址
-    } else {
-        printf("Invalid physical address: %p\n", (void *)pa);
-        return NULL;  // 返回 NULL 表示无效地址
-    }
-}
 #ifdef LAB_PGTBL
-void vmprint_walk(pagetable_t pagetable, int level, uint64 va_base) {
-    if (pagetable == 0)
-        return;
-
-    for (int i = 0; i < 512; i++) {
-        pte_t pte = pagetable[i];
-
-        // 如果 PTE 无效，跳过
-        if ((pte & PTE_V) == 0)
-            continue;
-
-        uint64 pa = PTE2PA(pte);  // 获取物理地址
-        uint64 va = va_base | ((uint64)i << (12 + 9 * level));  // 计算虚拟地址
-
-        // 打印当前页表项的信息，注意缩进
-        for (int j = 0; j < level; j++)
-            printf(" ..");
-
-        // 打印虚拟地址、PTE 和物理地址
-        printf("%p: pte %p pa %p\n", (void *)va, (void *)(uintptr_t)pte, (void *)(uintptr_t)pa);
-
-        // 如果 PTE 不含读/写/执行权限，且当前不是最后一层页表
-        if ((pte & (PTE_R | PTE_W | PTE_X)) == 0 && level > 0) {
-            // 将物理地址转换为内核虚拟地址
-            uint64 kva = (uint64)(pa2kva(pa));
-
-            // 检查 kva 是否有效，防止访问无效的地址
-if (kva != 0 && kva >= KERNBASE && kva < PHYSTOP + KERNBASE) {
-    // 递归调用打印下一级页表
-    vmprint_walk((pagetable_t)kva, level - 1, va);
-} else {
-    printf(" ..Skipping invalid kva=%p\n", (void *)kva);
-}
-        }
+void vmprint_helper(pagetable_t pagetable, uint64 va, int level)
+{
+  char *dots;
+  switch (level)
+  {
+  case 0:
+    dots = " ..";
+    break;
+  case 1:
+    dots = " .. ..";
+    break;
+  case 2:
+    dots = " .. .. ..";
+    break;
+  default:
+    dots = "............";
+    break;
+  }
+  for (int i = 0; i < 512; i++)
+  {
+    pte_t pte = pagetable[i];
+    if (pte & PTE_V)
+    {
+      uint64 child = PTE2PA(pte);
+      uint64 child_va = va + (i << (9 * (2 - level) + 12));
+      printf("%s%p: pte %p pa %p\n", dots, (void *)child_va, (void *)pte, (void *)child);
+      if (level < 2)
+      {
+        vmprint_helper((pagetable_t)child, child_va, level + 1);
+      }
     }
+  }
+}
+void
+vmprint(pagetable_t pagetable) {
+  // your code here
+  printf("page table %p\n", pagetable);
+  vmprint_helper(pagetable, 0, 0);
 }
 
-// 打印页表内容的入口函数
-void vmprint(pagetable_t pagetable) {
-    printf("page table %p\n", (void *)pagetable);
-    vmprint_walk(pagetable, 2, 0);
-}
 #endif
-
-
-
 
 
 
@@ -557,4 +623,4 @@ pte_t*
 pgpte(pagetable_t pagetable, uint64 va) {
   return walk(pagetable, va, 0);
 }
-#endif 
+#endif
