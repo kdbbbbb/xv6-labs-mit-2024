@@ -16,7 +16,6 @@ void kernelvec();
 
 extern int devintr();
 
-
 void
 trapinit(void)
 {
@@ -29,123 +28,112 @@ trapinithart(void)
 {
   w_stvec((uint64)kernelvec);
 }
+
+//
+// handle an interrupt, exception, or system call from user space.
+// called from trampoline.S
+//
 void
 usertrap(void)
 {
   int which_dev = 0;
 
-  if ((r_sstatus() & SSTATUS_SPP) != 0)
+  if((r_sstatus() & SSTATUS_SPP) != 0)
     panic("usertrap: not from user mode");
 
-  // 设置中断处理函数，切换到内核trap向量
+  // send interrupts and exceptions to kerneltrap(),
+  // since we're now in the kernel.
   w_stvec((uint64)kernelvec);
 
   struct proc *p = myproc();
-
-  // 保存用户态程序计数器
+  
+  // save user program counter.
   p->trapframe->epc = r_sepc();
+  
+  if(r_scause() == 8){
+    // system call
 
-  if (r_scause() == 8) {
-    // 用户态系统调用
-    if (p->killed)
+    if(killed(p))
       exit(-1);
 
-    // 跳过 ecall 指令
+    // sepc points to the ecall instruction,
+    // but we want to return to the next instruction.
     p->trapframe->epc += 4;
 
-    // 开启中断，处理后续中断
+    // an interrupt will change sepc, scause, and sstatus,
+    // so enable only now that we're done with those registers.
     intr_on();
 
     syscall();
-
-  } else if ((which_dev = devintr()) != 0) {
-    // 设备中断，正常处理
-
-  } else if (r_scause() == 13 || r_scause() == 15|| r_scause() == 12) {
-    // 页异常，可能是写时复制（COW）页面写异常
-    uint64 va = r_stval();
-    uint64 va_page = PGROUNDDOWN(va);
-
-    if (va_page >= p->sz) {
-      // 访问超出进程内存大小，杀死进程
-      p->killed = 1;
-      goto end;
+  } else if((which_dev = devintr()) != 0){
+    // ok
+  } else if( r_scause()==15){
+    struct proc* p=myproc();
+    uint64 va=r_stval();
+    if (va >= MAXVA){
+      setkilled(p);
+      goto err;
     }
+    pte_t *pte = walk(p->pagetable, va, 0);
 
-    pte_t *pte = cow_walk(p->pagetable, va_page);
-    if (pte == 0) {
-      // 不是有效的COW页，异常，杀死进程
-      p->killed = 1;
-      goto end;
+    if (pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0 )
+    {
+      setkilled(p);
+      goto err;
     }
-
-    uint64 pa = PTE2PA(*pte);
-    int refcnt = get_mem_count(pa);
-
-    if (refcnt < 1) {
-      // 引用计数不应为0或负，异常处理
-      p->killed = 1;
-      goto end;
-    } else if (refcnt > 1) {
-      // 共享物理页，需申请新页并复制内容
-
-      char *mem = kalloc();
-      if (mem == 0) {
-        // 分配失败，杀死进程
-        p->killed = 1;
-        goto end;
+    if (*pte & PTE_COW){
+      uint64 pa = PTE2PA(*pte);
+      // book p49:This book-keeping allows an important optimization: if a process incurs a store page fault and the
+      //physical page is only referred to from that process’s page table, no copy is needed
+      if (get_ref((void *)pa) == 1)
+      {
+        // 清除COW位并设置写权限
+        *pte  &= ~PTE_COW;  // 清除COW位
+        *pte |= PTE_W;      // 设置写权限
+        sfence_vma();
       }
+      else
+      {
+        char *mem = kalloc();
+        if (mem == 0)
+        {
+          printf("usertrap(): kalloc failed!pid=%d\n", p->pid);
+          printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
+          setkilled(p);
+        }
+        memmove(mem, (char *)pa, PGSIZE);
 
-      // 拷贝旧页面内容到新页
-      memmove(mem, (char*)pa, PGSIZE);
-
-      // 解除旧页映射，不释放物理页
-      uvmunmap(p->pagetable, va_page, 1, 0);
-
-      // 映射新页，设置用户读写执行权限
-      if (mappages(p->pagetable, va_page, PGSIZE, (uint64)mem,
-                   PTE_U | PTE_R | PTE_W | PTE_X) < 0) {
-        kfree(mem);
-        p->killed = 1;
-        goto end;
+        uint flags = PTE_FLAGS(*pte);
+        flags &= ~PTE_COW; 
+        flags |= PTE_W;    
+        *pte = PA2PTE(mem) | flags | PTE_V;
+        //dec_ref((void *)pa);
+        kfree((void *)pa);
+        sfence_vma();
       }
-
-      // 减少旧物理页引用计数
-      mem_count_down(pa);
-
-    } else if (refcnt == 1) {
-      // 只有一个引用，恢复页写权限，清除COW标志
-
-      *pte |= PTE_W;        // 允许写
-      *pte &= ~PTE_RSW;     // 清除COW标志
-      sfence_vma();         // 关键：刷新TLB，确保新PTE生效
-      
-      // 这里可能需要刷新 TLB，调用 sfence_vma()（如果你的 xv6 有此函数）
-    } else {
-      // 其他情况异常
-      p->killed = 1;
-      goto end;
     }
-
-  } else {
-    // 未知异常，打印信息并杀死进程
+    else
+    {
+      printf("usertrap(): write to read-only page\n");
+      setkilled(p);
+    }
+  }
+  else {
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
-    p->killed = 1;
+    setkilled(p);
   }
 
-end:
-  if (p->killed)
+err:
+  if(killed(p))
     exit(-1);
 
-  // 时钟中断让出CPU
-  if (which_dev == 2)
+  // give up the CPU if this is a timer interrupt.
+  if(which_dev == 2)
     yield();
 
   usertrapret();
 }
-
-
 
 //
 // return to user space
