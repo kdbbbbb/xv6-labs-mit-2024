@@ -11,80 +11,122 @@
 #include "net.h"
 
 // xv6's ethernet and IP addresses
-static uint8 local_mac[ETHADDR_LEN] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
+static uint8 local_mac[ETHADDR_LEN] = {0x52, 0x54, 0x00, 0x12, 0x34, 0x56};
 static uint32 local_ip = MAKE_IP_ADDR(10, 0, 2, 15);
 
 // qemu host's ethernet address.
-static uint8 host_mac[ETHADDR_LEN] = { 0x52, 0x55, 0x0a, 0x00, 0x02, 0x02 };
+static uint8 host_mac[ETHADDR_LEN] = {0x52, 0x55, 0x0a, 0x00, 0x02, 0x02};
 
 static struct spinlock netlock;
+// 定义端口绑定和数据包队列的结构
+#define MAX_PENDING_PACKETS 16
+#define min(a, b) ((a) < (b) ? (a) : (b))
 
-#define MAX_PORTS 1024
-#define UDP_RECV_QUEUE 16
-
-
-struct udp_packet {
-  uint32 src_ip;
-  uint16 sport;
-  uint16 len;
-  char *data;
+struct pending_packet
+{
+  char *data;      // 数据包内容
+  int len;         // 数据包长度
+  uint32 src_ip;   // 源IP地址
+  uint16 src_port; // 源端口
+  struct pending_packet *next;
 };
 
-struct udp_queue {
+struct bound_port
+{
+  uint16 port;       // 绑定的端口号
+  int pending_count; // 等待处理的包数量
   struct spinlock lock;
-  int bound;
-  int head;
-  int tail;
-  int size;
-  struct udp_packet packets[UDP_RECV_QUEUE];
+  struct pending_packet *head; // 包队列头
+  struct pending_packet *tail; // 包队列尾
 };
 
-static struct udp_queue udp_ports[MAX_PORTS];
+#define MAX_PORTS 64
+struct
+{
+  struct spinlock lock;
+  struct bound_port ports[MAX_PORTS];
+  int port_count;
+} udp_table;
 
 void
 netinit(void)
 {
   initlock(&netlock, "netlock");
-  for(int i = 0; i < MAX_PORTS; i++) {
-    struct udp_queue *q = &udp_ports[i];
-    initlock(&q->lock, "udpport");
-    q->bound = 0;
-    q->head = q->tail = q->size = 0;
-  }
+  udp_table.port_count = 0;
 }
 
-
+// 查找已绑定的端口
+static struct bound_port *
+find_bound_port(uint16 port)
+{
+  for (int i = 0; i < udp_table.port_count; i++)
+  {
+    if (udp_table.ports[i].port == port)
+      return &udp_table.ports[i];
+  }
+  return 0;
+}
 
 //
 // bind(int port)
 // prepare to receive UDP packets address to the port,
 // i.e. allocate any queues &c needed.
+//
 uint64
 sys_bind(void)
 {
-  int port;
-  argint(0, &port);
-  if(port < 0 || port >= MAX_PORTS)
-    return -1;
+  //
+  // Your code here.
+  //
 
-  struct udp_queue *q = &udp_ports[port];
-  acquire(&q->lock);
-  if(q->bound){
-    release(&q->lock);
+  int port;
+  // if (argint(0, &port) < 0)
+  //   return -1;
+  argint(0, &port);
+
+  acquire(&udp_table.lock);
+
+  // 检查端口是否已被绑定
+  if (find_bound_port(port) != 0)
+  {
+    release(&udp_table.lock);
     return -1;
   }
-  q->bound = 1;
-  q->head = q->tail = q->size = 0;
-  release(&q->lock);
+
+  // 检查是否还有空间绑定新端口
+  if (udp_table.port_count >= MAX_PORTS)
+  {
+    release(&udp_table.lock);
+    return -1;
+  }
+
+  // 初始化新的bound_port结构
+  struct bound_port *bp = &udp_table.ports[udp_table.port_count++];
+  bp->port = port;
+  bp->pending_count = 0;
+  bp->head = bp->tail = 0;
+  initlock(&bp->lock, "bound_port");
+
+  release(&udp_table.lock);
   return 0;
 }
-
 
 //
 // unbind(int port)
 // release any resources previously created by bind(port);
 // from now on UDP packets addressed to port should be dropped.
+//
+uint64
+sys_unbind(void)
+{
+  //
+  // Optional: Your code here.
+  //
 
+  return 0;
+}
+
+//
 // recv(int dport, int *src, short *sport, char *buf, int maxlen)
 // if there's a received UDP packet already queued that was
 // addressed to dport, then return it.
@@ -102,46 +144,90 @@ sys_bind(void)
 uint64
 sys_recv(void)
 {
-  int dport, maxlen;
-  uint64 srcva, sportva, bufva;
+  // 声明变量
+  int dport;
+  uint64 src_arg, sport_arg, buf;
+  int maxlen;
   struct proc *p = myproc();
+  struct bound_port *bp;
+  struct pending_packet *pp;
+  int ret = -1;
 
+  // 获取参数，检查参数有效性
   argint(0, &dport);
-  argaddr(1, &srcva);
-  argaddr(2, &sportva);
-  argaddr(3, &bufva);
+  argaddr(1, &src_arg);
+  argaddr(2, &sport_arg);
+  argaddr(3, &buf);
   argint(4, &maxlen);
 
-  if(dport < 0 || dport >= MAX_PORTS)
-    return -1;
+  // // 获取目标端口
+  // if (fetchaddr(dport_arg, &dport_val) < 0)
+  // {
+  //   return -1;
+  // }
+  // int dport = (int)dport_val;
 
-  struct udp_queue *q = &udp_ports[dport];
-  acquire(&q->lock);
-  while(q->bound && q->size == 0) {
-    sleep(q, &q->lock);
-  }
-
-  if(!q->bound || q->size == 0){
-    release(&q->lock);
-    return -1;
-  }
-
-  struct udp_packet *pkt = &q->packets[q->head];
-  int len = pkt->len < maxlen ? pkt->len : maxlen;
-  if (copyout(p->pagetable, srcva, (char *)&pkt->src_ip, sizeof(pkt->src_ip)) < 0 ||
-      copyout(p->pagetable, sportva, (char *)&pkt->sport, sizeof(pkt->sport)) < 0 ||
-      copyout(p->pagetable, bufva, pkt->data, len) < 0) {
-    release(&q->lock);
+  // 检查端口是否已绑定
+  acquire(&udp_table.lock);
+  if ((bp = find_bound_port(dport)) == 0)
+  {
+    release(&udp_table.lock);
     return -1;
   }
 
-  kfree(pkt->data);
-  q->head = (q->head + 1) % UDP_RECV_QUEUE;
-  q->size--;
+  // 切换锁的持有
+  acquire(&bp->lock);
+  release(&udp_table.lock);
 
-  release(&q->lock);
-  return len;
+  // 等待数据包
+  while (bp->head == 0)
+  {
+    if (p->killed)
+    {
+      release(&bp->lock);
+      return -1;
+    }
+    sleep(bp, &bp->lock);
+  }
+
+  // 从队列中取出数据包
+  pp = bp->head;
+  bp->head = pp->next;
+  if (bp->head == 0)
+  {
+    bp->tail = 0;
+  }
+  bp->pending_count--;
+
+  // 先复制源地址和端口，因为这些比较小且固定大小
+  if (copyout(p->pagetable, src_arg, (char *)&pp->src_ip, sizeof(pp->src_ip)) < 0 ||
+      copyout(p->pagetable, sport_arg, (char *)&pp->src_port, sizeof(pp->src_port)) < 0)
+  {
+    goto bad;
+  }
+
+  // 复制数据，注意长度限制
+  int copy_len = pp->len;
+  if (copy_len > maxlen)
+    copy_len = maxlen;
+
+  if (copyout(p->pagetable, buf, pp->data, copy_len) < 0)
+  {
+    goto bad;
+  }
+
+  // 设置返回值为实际拷贝的数据长度
+  ret = copy_len;
+
+bad:
+  // 清理资源
+  if (pp->data)
+    kfree(pp->data);
+  kfree(pp);
+  release(&bp->lock);
+  return ret;
 }
+
 // This code is lifted from FreeBSD's ping.c, and is copyright by the Regents
 // of the University of California.
 static unsigned short
@@ -157,13 +243,15 @@ in_cksum(const unsigned char *addr, int len)
    * sequential 16 bit words to it, and at the end, fold back all the
    * carry bits from the top 16 bits into the lower 16 bits.
    */
-  while (nleft > 1)  {
+  while (nleft > 1)
+  {
     sum += *w++;
     nleft -= 2;
   }
 
   /* mop up an odd byte, if necessary */
-  if (nleft == 1) {
+  if (nleft == 1)
+  {
     *(unsigned char *)(&answer) = *(const unsigned char *)w;
     sum += answer;
   }
@@ -184,7 +272,9 @@ uint64
 sys_send(void)
 {
   struct proc *p = myproc();
-  int sport, dst, dport;
+  int sport;
+  int dst;
+  int dport;
   uint64 bufaddr;
   int len;
 
@@ -194,10 +284,9 @@ sys_send(void)
   argaddr(3, &bufaddr);
   argint(4, &len);
 
-  if (sport < 0 || dst < 0 || dport < 0 || len < 0)
-    return -1;
   int total = len + sizeof(struct eth) + sizeof(struct ip) + sizeof(struct udp);
- 
+  if(total > PGSIZE)
+    return -1;
 
   char *buf = kalloc();
   if(buf == 0){
@@ -212,7 +301,7 @@ sys_send(void)
   eth->type = htons(ETHTYPE_IP);
 
   struct ip *ip = (struct ip *)(eth + 1);
-  ip->ip_vhl = 0x45;
+  ip->ip_vhl = 0x45; // version 4, header length 4*5
   ip->ip_tos = 0;
   ip->ip_len = htons(sizeof(struct ip) + sizeof(struct udp) + len);
   ip->ip_id = 0;
@@ -221,14 +310,12 @@ sys_send(void)
   ip->ip_p = IPPROTO_UDP;
   ip->ip_src = htonl(local_ip);
   ip->ip_dst = htonl(dst);
-  ip->ip_sum = 0;
   ip->ip_sum = in_cksum((unsigned char *)ip, sizeof(*ip));
 
   struct udp *udp = (struct udp *)(ip + 1);
   udp->sport = htons(sport);
   udp->dport = htons(dport);
   udp->ulen = htons(len + sizeof(struct udp));
-  udp->sum = 0;  // 关闭UDP校验和
 
   char *payload = (char *)(udp + 1);
   if(copyin(p->pagetable, payload, bufaddr, len) < 0){
@@ -237,21 +324,112 @@ sys_send(void)
     return -1;
   }
 
-  int ret = e1000_transmit(buf, total);
-  if(ret < 0){
-    kfree(buf);
-    printf("send: e1000_transmit failed\n");
-    return -1;
-  }
-
-  // 这里假设 e1000_transmit 不会释放 buf，调用 kfree 释放内存
-  kfree(buf);
+  e1000_transmit(buf, total);
 
   return 0;
 }
 
+void
+ip_rx(char *buf, int len)
+{
+  // don't delete this printf; make grade depends on it.
+  static int seen_ip = 0;
+  if(seen_ip == 0)
+    printf("ip_rx: received an IP packet\n");
+  seen_ip = 1;
 
+  // 基本长度检查
+  // if (len < sizeof(struct eth) + sizeof(struct ip)){
+  //   printf("not ip length!\n");
+  //   return;}
 
+  struct eth *ethhdr = (struct eth *)buf;
+  struct ip *iphdr = (struct ip *)(ethhdr + 1);
+
+  // IP头部检查
+  // if (iphdr->ip_p != IPPROTO_UDP){
+  //   printf("not ip header!\n");
+  //   return;}
+
+  // UDP头部长度检查
+  if (len < sizeof(struct eth) + sizeof(struct ip) + sizeof(struct udp)){
+    printf("not udp length\n"); 
+    return;}
+
+  struct udp *udphdr = (struct udp *)(iphdr + 1);
+  int udp_len = ntohs(udphdr->ulen);
+  if (udp_len < sizeof(struct udp) ||
+      len < sizeof(struct eth) + sizeof(struct ip) + udp_len)
+    return;
+
+  uint16 dport = ntohs(udphdr->dport);
+
+  // 查找绑定的端口
+  acquire(&udp_table.lock);
+  struct bound_port *bp = find_bound_port(dport);
+  if (bp == 0)
+  {
+    printf("bp is 0!\n");
+    kfree(buf);
+    release(&udp_table.lock);
+    return;
+  }
+
+  // 切换锁
+  acquire(&bp->lock);
+  release(&udp_table.lock);
+
+  // 检查队列容量
+  if (bp->pending_count >= MAX_PENDING_PACKETS)
+  {
+    printf("pending counts is larger than 16!\n");
+    goto bad;
+  }
+
+  // 分配内存
+  int payload_len = ntohs(udphdr->ulen) - sizeof(struct udp);
+  char *data = kalloc();
+  if (data == 0)
+  {
+    printf("kalloc data failed\n");
+    goto bad;
+  }
+
+  struct pending_packet *pp = kalloc();
+  if (pp == 0)
+  {
+    printf("kalloc pending packet failed\n");
+    kfree(data);
+    goto bad;
+  }
+
+  // 初始化新包
+  memset(pp, 0, sizeof(*pp));
+  memmove(data, (char *)(udphdr + 1), payload_len);
+  pp->data = data;
+  pp->len = payload_len;
+  pp->src_ip = ntohl(iphdr->ip_src);
+  pp->src_port = ntohs(udphdr->sport);
+  pp->next = 0;
+
+  // 更新队列
+  if (bp->tail == 0)
+  {
+    bp->head = bp->tail = pp;
+  }
+  else
+  {
+    bp->tail->next = pp;
+    bp->tail = pp;
+  }
+  bp->pending_count++;
+  
+  // 唤醒等待的进程
+  wakeup(bp);
+bad:
+  kfree(buf);
+  release(&bp->lock);
+}
 
 //
 // send an ARP reply packet to tell qemu to map
@@ -300,63 +478,10 @@ arp_rx(char *inbuf)
 
   kfree(inbuf);
 }
-void ip_rx(char *buf, int len)
-{
-  static int seen_ip = 0;
-  if (seen_ip == 0)
-    printf("ip_rx: received an IP packet\n");
-  seen_ip = 1;
-
-  struct eth *eth = (struct eth *)buf;
-  struct ip *ip = (struct ip *)(eth + 1);
-
-  if (ip->ip_p != IPPROTO_UDP) {
-    kfree(buf);
-    return;
-  }
-
-  int ip_len = ntohs(ip->ip_len);  // 使用 ntohs 转换 IP 长度
-  struct udp *udp = (struct udp *)(ip + 1);
-  int dport = ntohs(udp->dport);   // 目标端口
-  int sport = ntohs(udp->sport);   // 源端口
-  uint32 src_ip = ntohl(ip->ip_src);  // 源 IP
-  int data_len = ip_len - sizeof(struct ip) - sizeof(struct udp);  // 计算有效载荷长度
-
-  if (dport >= MAX_PORTS) {  // 检查目标端口是否合法
-    kfree(buf);
-    return;
-  }
-
-  struct udp_queue *q = &udp_ports[dport];
-  acquire(&q->lock);
-
-  // 如果端口未绑定或队列已满，丢弃数据包
-  if (!q->bound || q->size >= UDP_RECV_QUEUE) {
-    release(&q->lock);
-    kfree(buf);
-    return;
-  }
-
-  // 存储数据包信息
-  struct udp_packet *pkt = &q->packets[q->tail];
-  pkt->src_ip = src_ip;
-  pkt->sport = sport;
-  pkt->len = data_len;
-  pkt->data = buf;
-
-  // 更新队列
-  q->tail = (q->tail + 1) % UDP_RECV_QUEUE;
-  q->size++;
-
-  // 唤醒等待数据包的进程
-  wakeup(q); 
-  release(&q->lock);
-}
 
 void
 net_rx(char *buf, int len)
 {
-  
   struct eth *eth = (struct eth *) buf;
 
   if(len >= sizeof(struct eth) + sizeof(struct arp) &&
@@ -368,25 +493,4 @@ net_rx(char *buf, int len)
   } else {
     kfree(buf);
   }
-}
-uint64
-sys_unbind(void)
-{
-  // 这里可以简单实现，释放端口绑定状态
-  int port;
-  argint(0, &port);
-  if(port < 0 || port >= MAX_PORTS)
-    return -1;
-
-  struct udp_queue *q = &udp_ports[port];
-  acquire(&q->lock);
-  if(!q->bound){
-    release(&q->lock);
-    return -1;
-  }
-  q->bound = 0;
-  q->head = q->tail = q->size = 0;
-  release(&q->lock);
-  wakeup(q);  // 唤醒等待recv的进程
-  return 0;
 }
